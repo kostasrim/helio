@@ -512,6 +512,8 @@ int UringProactor::BufRingAvailable(unsigned group_id) const {
 }
 
 int UringProactor::CancelRequests(int fd, unsigned flags) {
+  LOG(INFO) << "CancelRequests fd: " << fd << " flags: " << flags;
+
   io_uring_sync_cancel_reg reg_arg;
   memset(&reg_arg, 0, sizeof(reg_arg));
   reg_arg.timeout.tv_nsec = -1;
@@ -547,9 +549,14 @@ void UringProactor::EpollDel(EpollIndex id) {
     reg_arg.flags = 0;
     reg_arg.addr = uid;
 
+    LOG(INFO) << "EpollDel before sync_cancel fd: " << fd << " uid: " << uid;
     int res = io_uring_register_sync_cancel(&ring_, &reg_arg);
+    LOG(INFO) << "EpollDel sync_cancel fd: " << fd << " uid: " << uid << " res: " << res;
+    if (res < 0) {
+      google::FlushLogFiles(google::INFO);
+      LOG_IF(ERROR, res < 0) << "EpollDel: unexpected result " << fd << " " << -res;
+    }
 
-    LOG_IF(ERROR, res < 0) << "EpollDel: unexpected result " << fd << " " << -res;
   } else {
     IoResult res;
     do {
@@ -974,6 +981,7 @@ void UringProactor::WakeRing() {
 
 void UringProactor::EpollAddInternal(EpollEntry* entry) {
   auto uring_cb = [entry](detail::FiberInterface* p, IoResult res, uint32_t flags, uint32_t) {
+    LOG(INFO) << "EpollAdd cb fd: " << entry->fd << " " << entry->index << " error: " << res;
     if (res >= 0) {
       DCHECK(flags & IORING_CQE_F_MORE);
       entry->cb(res);
@@ -986,6 +994,7 @@ void UringProactor::EpollAddInternal(EpollEntry* entry) {
   SubmitEntry se = GetSubmitEntry(std::move(uring_cb));
   se.PrepPollAdd(entry->fd, entry->event_mask);
   entry->index = se.sqe()->user_data;
+  LOG(INFO) << "EpollAdd fd: " << entry->fd << " index: " << entry->index;
   se.sqe()->len = IORING_POLL_ADD_MULTI;
 }
 

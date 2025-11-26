@@ -79,6 +79,7 @@ auto UringSocket::Close() -> error_code {
     error_cb_wrapper_ = nullptr;
   }
 
+  LOG(INFO) << "Closing socket fd: " << ShiftedFd();
   ResetOnRecvHook();
 
   int fd;
@@ -509,6 +510,7 @@ void UringSocket::RegisterOnRecv(OnRecvCb cb) {
 }
 
 void UringSocket::ResetOnRecvHook() {
+  LOG(INFO) << "ResetOnRecvHook  " << native_handle();
   if (recv_poll_id_) {
     Proactor* p = GetProactor();
     p->EpollDel(recv_poll_id_);
