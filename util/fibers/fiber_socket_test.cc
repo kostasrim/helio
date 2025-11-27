@@ -4,7 +4,10 @@
 
 #include <gmock/gmock.h>
 
+#include <condition_variable>
+#include <memory>
 #include <thread>
+#include <variant>
 
 #include "base/gtest.h"
 #include "base/logging.h"
@@ -17,6 +20,8 @@
 #include "util/fibers/uring_socket.h"
 #endif
 #include "util/fibers/epoll_proactor.h"
+#include "util/proactor_pool.h"
+#include "util/fibers/pool.h"
 
 namespace util {
 namespace fb2 {
@@ -771,6 +776,166 @@ TEST_P(FiberSocketTest, LeakAsyncWrite) {
 
   // Close immediately without waiting for completion
   proactor_->Await([&] { std::ignore = sock->Close(); });
+}
+
+class ConnectionStorm : public testing::TestWithParam<TestParams> {
+ protected:
+  void SetUp() final {
+    pp_.reset(Pool::IOUring(1024, 4));
+    pp_->Run();
+
+    pp_->at(0)->AwaitBrief([&]() {
+      listen_socket_.reset(pp_->at(0)->CreateSocket());
+      ASSERT_FALSE(listen_socket_->Listen(0, 0));
+      listen_port_ = listen_socket_->LocalEndpoint().port();
+    });
+
+    auto address = boost::asio::ip::make_address("127.0.0.1");
+    listen_ep_ = FiberSocketBase::endpoint_type{address, listen_port_};
+
+    accept_fb_ = pp_->at(0)->LaunchFiber("AcceptFb", [this] {
+      std::vector<Fiber> clients;
+      Fiber f;
+      for(size_t i = 0; i < 10; ++i) {
+        auto accept_res = listen_socket_->Accept();
+        VLOG_IF(1, !accept_res) << "Accept res: " << accept_res.error();
+        if(!accept_res) {
+          // TODO check why we stop accepting
+          LOG(WARNING) << "Failed to accept" << i;
+          continue;
+        }
+  
+        EXPECT_TRUE(accept_res);
+        std::unique_ptr<FiberSocketBase> sock_;
+        sock_.reset(*accept_res);
+        sock_->SetProactor(pp_->at(1));
+
+        f = pp_->at(1)->LaunchFiber([sock = std::move(sock_)]() {
+          // read_cb
+          bool done = false;
+          size_t total_read = 0;
+          util::fb2::EventCount io_event;
+          std::unique_ptr<bool> closed = std::make_unique<bool>(false);
+          auto *ptr = closed.get();
+          auto read_cb = [&, closed = std::move(closed)](const FiberSocketBase::RecvNotification& n) {
+            // rec
+            ASSERT_FALSE(*closed);
+            if(std::holds_alternative<bool>(n.read_result)) {
+              if(std::get<bool>(n.read_result)) {
+                while(true) {
+                std::vector<char> buf(20000);
+                  int res = recv(sock->native_handle(), buf.data(), buf.size(), 0);
+                  if (res < 0) { 
+                    EXPECT_TRUE(errno == EAGAIN || errno == EWOULDBLOCK || errno == ECONNRESET);
+                    return;
+                  }
+                  if (res == 0) {
+                    return;
+                  }
+                  total_read += res;
+                  if(total_read == (3096 * 2) + 512) {
+                    done = true;
+                    io_event.notify();
+                  }
+                }
+                // rest read path
+              } 
+            }
+          };
+          
+          sock->RegisterOnRecv([&](auto res) {
+            read_cb(res);
+          });
+
+          // Try recv first
+          read_cb({true});
+
+          std::cv_status res = io_event.await_until([&done]() { 
+            return done; 
+          }, chrono::steady_clock::now() + 30000ms);
+
+          ASSERT_EQ(res, std::cv_status::no_timeout);
+          std::vector<uint8_t> buf(512, 1);
+          ASSERT_FALSE(sock->Write(buf));
+          std::ignore = sock->Close();
+          *ptr = true;
+        });
+
+        clients.push_back(std::move(f));
+      }
+
+
+      for(auto& f : clients) {
+        f.Join();
+      }
+
+    });
+  }
+
+  void TearDown() final {
+    VLOG(1) << "TearDown";
+    pp_->at(0)->Await([&] {
+      std::ignore = listen_socket_->Shutdown(SHUT_RDWR);
+      std::ignore = listen_socket_->Close();
+    });
+
+    accept_fb_.JoinIfNeeded();
+
+    // We close here because we need to wake up listening socket.
+    pp_->at(0)->Await([&] { std::ignore = listen_socket_->Close(); });
+
+    pp_->Stop();
+    pp_.reset();
+  }
+
+  static void SetUpTestCase() {
+    testing::FLAGS_gtest_death_test_style = "threadsafe";
+  }
+
+  // Return the proactor type parameter
+  string_view GetProactorType() const {
+    return GetParam().proactor_type;
+  }
+
+  using IoResult = int;
+
+  unique_ptr<ProactorPool> pp_;
+
+  unique_ptr<FiberSocketBase> listen_socket_;
+
+  uint16_t listen_port_ = 0;
+  Fiber accept_fb_;
+  std::error_code accept_ec_;
+  FiberSocketBase::endpoint_type listen_ep_;
+  uint32_t conn_sock_err_mask_ = 0;
+};
+
+TEST_F(ConnectionStorm, RegisterOnRecvDeadlock) {
+  pp_->at(3)->Await([this]() {
+    std::vector<Fiber> clients;
+    for(size_t i = 0; i < 10; ++i) {
+      auto fb = pp_->at(2)->LaunchFiber([&, this] {
+        unique_ptr<FiberSocketBase> sock(pp_->at(2)->CreateSocket());
+        EXPECT_FALSE(sock->Connect(listen_ep_));
+        {
+          std::vector<uint8_t> buf(3096, 1);
+          EXPECT_FALSE(sock->Write(buf));
+          EXPECT_FALSE(sock->Write(buf));
+        }
+        std::vector<uint8_t> buf(512, 1);
+        EXPECT_FALSE(sock->Write(buf));
+        io::MutableBytes in(buf.data(), 512);
+        sock->Recv(in);
+        std::ignore = sock->Close();
+      });
+
+      clients.push_back(std::move(fb));
+    }
+
+    for(auto& f : clients) {
+      f.Join();
+    }
+  });
 }
 
 }  // namespace fb2
